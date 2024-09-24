@@ -1,0 +1,388 @@
+#pip install cryptography
+
+import os
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from cryptography.hazmat.primitives import hashes, padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms as crypto_algorithms, modes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.backends import default_backend
+import base64
+import json
+import hashlib
+import hmac
+import platform
+import subprocess
+import shutil
+
+# Función para derivar una clave a partir de una contraseña y sal
+def derive_key(password, salt):
+    """
+    Deriva una clave AES de 32 bytes a partir de una contraseña y una sal usando PBKDF2HMAC.
+    """
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,  # AES-256 requiere una clave de 32 bytes
+        salt=salt,
+        iterations=100000,
+        backend=default_backend()
+    )
+    key = kdf.derive(password.encode())
+    return key
+
+# Función para encriptar un archivo
+def encrypt_file(file_path, key):
+    """
+    Encripta un archivo usando AES en modo CBC con padding PKCS7.
+    """
+    # Generar un IV aleatorio de 16 bytes
+    iv = os.urandom(16)
+    cipher = Cipher(crypto_algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    padder = padding.PKCS7(128).padder()
+    
+    # Leer el contenido del archivo
+    with open(file_path, 'rb') as f:
+        data = f.read()
+    
+    # Aplicar padding y encriptar
+    padded_data = padder.update(data) + padder.finalize()
+    encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
+    
+    # Escribir el IV y los datos encriptados de vuelta al archivo con extensión .enc
+    with open(file_path + '.enc', 'wb') as f:
+        f.write(iv + encrypted_data)
+    
+    # Eliminar el archivo original
+    os.remove(file_path)
+
+# Función para desencriptar un archivo
+def decrypt_file(file_path, key):
+    """
+    Desencripta un archivo usando AES en modo CBC con padding PKCS7.
+    """
+    with open(file_path, 'rb') as f:
+        iv = f.read(16)  # Leer el IV
+        encrypted_data = f.read()
+    
+    cipher = Cipher(crypto_algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    decrypted_padded = decryptor.update(encrypted_data) + decryptor.finalize()
+    
+    unpadder = padding.PKCS7(128).unpadder()
+    decrypted_data = unpadder.update(decrypted_padded) + unpadder.finalize()
+    
+    # Obtener el nombre original del archivo eliminando la extensión .enc
+    original_file_path = file_path[:-4]
+    
+    # Escribir los datos desencriptados al archivo original
+    with open(original_file_path, 'wb') as f:
+        f.write(decrypted_data)
+    
+    # Eliminar el archivo encriptado
+    os.remove(file_path)
+
+# Función para encriptar todos los archivos en una carpeta
+def encrypt_folder(folder_path, password):
+    """
+    Encripta todos los archivos en la carpeta especificada usando la contraseña proporcionada.
+    """
+    # Generar una sal aleatoria de 16 bytes
+    salt = os.urandom(16)
+    key = derive_key(password, salt)
+    
+    # Guardar la sal y el hash de la contraseña en un archivo oculto dentro de la carpeta
+    lock_info = {
+        'salt': base64.b64encode(salt).decode(),
+        'password_hash': base64.b64encode(hashlib.sha256(password.encode()).digest()).decode()
+    }
+    salt_path = os.path.join(folder_path, '.lock_info.json')
+    with open(salt_path, 'w') as f:
+        json.dump(lock_info, f)
+    
+    # Ocultar el archivo de información
+    hide_file(salt_path)
+    
+    # Recorrer todos los archivos en la carpeta
+    for root, dirs, files in os.walk(folder_path):
+        for file in files:
+            # Ignorar el archivo de sal y cualquier archivo ya encriptado
+            if file == '.lock_info.json' or file.endswith('.enc'):
+                continue
+            file_path = os.path.join(root, file)
+            try:
+                encrypt_file(file_path, key)
+            except Exception as e:
+                messagebox.showerror("Error", f"Error al encriptar {file}: {str(e)}")
+                return False
+    # Ocultar la carpeta después de encriptar
+    hide_folder(folder_path)
+    return True
+
+# Función para desencriptar todos los archivos en una carpeta
+def decrypt_folder(folder_path, password):
+    """
+    Desencripta todos los archivos en la carpeta especificada usando la contraseña proporcionada.
+    """
+    # Leer la sal y el hash de la contraseña desde el archivo oculto
+    salt_path = os.path.join(folder_path, '.lock_info.json')
+    if not os.path.exists(salt_path):
+        messagebox.showerror("Error", "No se encontró el archivo de información de bloqueo. ¿La carpeta está encriptada?")
+        return False
+    with open(salt_path, 'r') as f:
+        lock_info = json.load(f)
+    salt = base64.b64decode(lock_info['salt'])
+    stored_password_hash = base64.b64decode(lock_info['password_hash'])
+    
+    # Verificar la contraseña
+    entered_password_hash = hashlib.sha256(password.encode()).digest()
+    if not constant_time_compare(stored_password_hash, entered_password_hash):
+        messagebox.showerror("Error", "Contraseña incorrecta.")
+        return False
+    
+    key = derive_key(password, salt)
+    
+    # Desencriptar todos los archivos con extensión .enc
+    for root, dirs, files in os.walk(folder_path):
+        for file in files:
+            # Ignorar el archivo de sal y cualquier archivo no encriptado
+            if file == '.lock_info.json' or not file.endswith('.enc'):
+                continue
+            file_path = os.path.join(root, file)
+            try:
+                decrypt_file(file_path, key)
+            except Exception as e:
+                messagebox.showerror("Error", f"Error al desencriptar {file}: {str(e)}")
+                return False
+    # Eliminar el archivo de información de bloqueo
+    os.remove(salt_path)
+    # Mostrar la carpeta después de desencriptar
+    show_folder(folder_path)
+    return True
+
+# Función para comparar claves en tiempo constante
+def constant_time_compare(val1, val2):
+    """
+    Compara dos valores en tiempo constante para evitar ataques de temporización.
+    """
+    return hmac.compare_digest(val1, val2)
+
+# Funciones para ocultar y mostrar la carpeta
+def hide_folder(folder_path):
+    """
+    Oculta la carpeta en sistemas Windows y Unix-like.
+    """
+    current_os = platform.system()
+    try:
+        if current_os == "Windows":
+            subprocess.check_call(['attrib', '+h', folder_path])
+        elif current_os in ["Linux", "Darwin"]:  # Darwin es macOS
+            # Renombrar la carpeta para que comience con un punto
+            parent_dir, folder_name = os.path.split(folder_path)
+            if not folder_name.startswith('.'):
+                new_folder_name = '.' + folder_name
+                new_folder_path = os.path.join(parent_dir, new_folder_name)
+                os.rename(folder_path, new_folder_path)
+                return new_folder_path
+        else:
+            messagebox.showwarning("Advertencia", f"Sistema operativo {current_os} no soportado para ocultar carpetas.")
+    except Exception as e:
+        messagebox.showerror("Error", f"Error al ocultar la carpeta: {str(e)}")
+    return folder_path
+
+def show_folder(folder_path):
+    """
+    Muestra la carpeta en sistemas Windows y Unix-like.
+    """
+    current_os = platform.system()
+    try:
+        if current_os == "Windows":
+            subprocess.check_call(['attrib', '-h', folder_path])
+        elif current_os in ["Linux", "Darwin"]:  # Darwin es macOS
+            # Renombrar la carpeta para eliminar el punto al inicio
+            parent_dir, folder_name = os.path.split(folder_path)
+            if folder_name.startswith('.'):
+                new_folder_name = folder_name.lstrip('.')
+                new_folder_path = os.path.join(parent_dir, new_folder_name)
+                os.rename(folder_path, new_folder_path)
+                return new_folder_path
+        else:
+            messagebox.showwarning("Advertencia", f"Sistema operativo {current_os} no soportado para mostrar carpetas.")
+    except Exception as e:
+        messagebox.showerror("Error", f"Error al mostrar la carpeta: {str(e)}")
+    return folder_path
+
+# Funciones para ocultar y mostrar archivos
+def hide_file(file_path):
+    """
+    Oculta un archivo en sistemas Windows y Unix-like.
+    """
+    current_os = platform.system()
+    try:
+        if current_os == "Windows":
+            subprocess.check_call(['attrib', '+h', file_path])
+        elif current_os in ["Linux", "Darwin"]:
+            # Renombrar el archivo para que comience con un punto
+            parent_dir, file_name = os.path.split(file_path)
+            if not file_name.startswith('.'):
+                new_file_name = '.' + file_name
+                new_file_path = os.path.join(parent_dir, new_file_name)
+                os.rename(file_path, new_file_path)
+                return new_file_path
+        else:
+            pass  # No soportado
+    except Exception as e:
+        messagebox.showerror("Error", f"Error al ocultar el archivo {file_path}: {str(e)}")
+
+def show_file(file_path):
+    """
+    Muestra un archivo en sistemas Windows y Unix-like.
+    """
+    current_os = platform.system()
+    try:
+        if current_os == "Windows":
+            subprocess.check_call(['attrib', '-h', file_path])
+        elif current_os in ["Linux", "Darwin"]:
+            # Renombrar el archivo para eliminar el punto al inicio
+            parent_dir, file_name = os.path.split(file_path)
+            if file_name.startswith('.'):
+                new_file_name = file_name.lstrip('.')
+                new_file_path = os.path.join(parent_dir, new_file_name)
+                os.rename(file_path, new_file_path)
+                return new_file_path
+        else:
+            pass  # No soportado
+    except Exception as e:
+        messagebox.showerror("Error", f"Error al mostrar el archivo {file_path}: {str(e)}")
+
+# Clase para la interfaz gráfica
+class LockApp:
+    def __init__(self, master):
+        self.master = master
+        master.title("Protector by Viaja Tech")  # Cambio de título
+        master.geometry("500x400")
+        master.resizable(False, False)
+
+        self.selected_folder = ""
+        self.locked_folder_path = ""  # Para manejar el cambio de nombre en Unix-like
+
+        # Etiqueta para instrucciones
+        self.label = tk.Label(master, text="Seleccione una carpeta para proteger:")
+        self.label.pack(pady=10)
+
+        # Botón para seleccionar carpeta
+        self.select_button = tk.Button(master, text="Seleccionar Carpeta", command=self.select_folder, width=20, height=2)
+        self.select_button.pack(pady=5)
+
+        # Campo para ingresar contraseña
+        self.pw_label = tk.Label(master, text="Ingrese una contraseña:")
+        self.pw_label.pack(pady=5)
+        self.pw_entry = tk.Entry(master, show="*", width=40)
+        self.pw_entry.pack(pady=5)
+
+        # Campo para confirmar contraseña (solo para encriptar)
+        self.pw_confirm_label = tk.Label(master, text="Confirme la contraseña:")
+        self.pw_confirm_label.pack(pady=5)
+        self.pw_confirm_entry = tk.Entry(master, show="*", width=40)
+        self.pw_confirm_entry.pack(pady=5)
+
+        # Botones para encriptar y desencriptar
+        self.lock_button = tk.Button(master, text="Encriptar Carpeta", command=self.lock_folder, bg="red", fg="white", width=20, height=2)
+        self.lock_button.pack(pady=10)
+
+        self.unlock_button = tk.Button(master, text="Desencriptar Carpeta", command=self.unlock_folder, bg="green", fg="white", width=20, height=2)
+        self.unlock_button.pack(pady=5)
+
+        # Etiqueta de estado
+        self.status = tk.Label(master, text="Estado: Esperando acción", fg="blue")
+        self.status.pack(pady=10)
+
+    def select_folder(self):
+        folder_selected = filedialog.askdirectory()
+        if folder_selected:
+            self.selected_folder = folder_selected
+            messagebox.showinfo("Carpeta Seleccionada", f"Carpeta seleccionada:\n{self.selected_folder}")
+            self.status.config(text=f"Carpeta seleccionada: {self.selected_folder}")
+
+    def lock_folder(self):
+        if not self.selected_folder:
+            messagebox.showerror("Error", "Por favor, seleccione una carpeta primero.")
+            return
+        password = self.pw_entry.get()
+        password_confirm = self.pw_confirm_entry.get()
+        if not password or not password_confirm:
+            messagebox.showerror("Error", "Por favor, ingrese y confirme la contraseña.")
+            return
+        if password != password_confirm:
+            messagebox.showerror("Error", "Las contraseñas no coinciden.")
+            return
+        confirm = messagebox.askyesno("Confirmar Encriptación", f"¿Estás seguro de encriptar todos los archivos en:\n{self.selected_folder}?")
+        if confirm:
+            self.status.config(text="Encriptando...", fg="orange")
+            self.master.update_idletasks()
+            success = encrypt_folder(self.selected_folder, password)
+            if success:
+                # Ocultar la carpeta
+                new_path = hide_folder(self.selected_folder)
+                if new_path != self.selected_folder:
+                    self.locked_folder_path = new_path
+                self.status.config(text="Encriptación y ocultación completadas con éxito", fg="green")
+                messagebox.showinfo("Éxito", "La carpeta ha sido encriptada y ocultada exitosamente.")
+                # Limpiar campos
+                self.pw_entry.delete(0, tk.END)
+                self.pw_confirm_entry.delete(0, tk.END)
+            else:
+                self.status.config(text="Error en la encriptación", fg="red")
+
+    def unlock_folder(self):
+        # Determinar la ruta actual de la carpeta (puede haber sido renombrada)
+        current_os = platform.system()
+        if current_os in ["Linux", "Darwin"]:  # Unix-like systems
+            if self.locked_folder_path:
+                folder_path = self.locked_folder_path
+            else:
+                # Intentar encontrar la carpeta renombrada con un punto
+                parent_dir, folder_name = os.path.split(self.selected_folder)
+                hidden_folder_name = '.' + folder_name
+                hidden_folder_path = os.path.join(parent_dir, hidden_folder_name)
+                if os.path.exists(hidden_folder_path):
+                    folder_path = hidden_folder_path
+                    self.locked_folder_path = folder_path
+                else:
+                    folder_path = self.selected_folder
+        else:
+            folder_path = self.selected_folder
+
+        if not folder_path:
+            messagebox.showerror("Error", "Por favor, seleccione una carpeta primero.")
+            return
+        password = self.pw_entry.get()
+        if not password:
+            messagebox.showerror("Error", "Por favor, ingrese la contraseña.")
+            return
+        confirm = messagebox.askyesno("Confirmar Desencriptación", f"¿Estás seguro de desencriptar todos los archivos en:\n{self.selected_folder}?")
+        if confirm:
+            self.status.config(text="Desencriptando...", fg="orange")
+            self.master.update_idletasks()
+            success = decrypt_folder(folder_path, password)
+            if success:
+                # Mostrar la carpeta
+                new_path = show_folder(folder_path)
+                if new_path != folder_path:
+                    self.selected_folder = new_path
+                self.status.config(text="Desencriptación y visualización completadas con éxito", fg="green")
+                messagebox.showinfo("Éxito", "La carpeta ha sido desencriptada y mostrada exitosamente.")
+                # Limpiar campos
+                self.pw_entry.delete(0, tk.END)
+                self.pw_confirm_entry.delete(0, tk.END)
+            else:
+                self.status.config(text="Error en la desencriptación", fg="red")
+
+# Función principal
+def main():
+    root = tk.Tk()
+    app = LockApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
